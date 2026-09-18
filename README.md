@@ -10,6 +10,7 @@
 - **按订阅投递熔断器**：同一订阅连续最终失败达到 `BREAKER_FAILURE_THRESHOLD` 次即原子熔断（`open`），熔断期间事件照常入库但工作器不再领取；冷却 `BREAKER_COOLDOWN_SECONDS` 秒后仅放行最早待投递任务作为唯一 half-open 探针——成功则关闭并清零计数，失败则重新熔断并刷新冷却时间；状态持久化在 SQLite 中，重启后保持
 - **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗
 - **入站幂等与防重放**：已接收的 `X-Webhook-Id` 持久化在 SQLite 中；重复 ID + 相同内容返回首次接收结果且不重复投递，相同 ID 不同内容返回 `409`
+- **事件定时投递**：`POST /events` 支持可选 `deliver_at`（带时区的未来 ISO-8601 时间，如 `2026-09-20T09:00:00Z`；省略或为 `null` 表示立即投递）。计划时间持久化到任务，工作器在到点前绝不认领（无内存定时器，重启同样生效）；同订阅严格按 `task_id` 有序，因此较早的定时任务会阻塞其后的所有任务（包括立即投递的任务），直到该定时任务投递成功、最终失败或被撤销。`GET /events/{id}` 返回每个任务的 `deliver_at`；缺少时区、过去时间、非法格式均返回 `422`
 - **事件投递**：一次提交可指定多个订阅，每个订阅生成独立任务
 - **事件级撤销**：`POST /events/{id}/cancel` 在单个 SQLite 原子事务中仅撤销尚未被工作器认领（`pending`）的投递任务；已在投递中（`in_progress`）或已结束（`delivered`/`failed`）的任务保持原结果。被撤销任务进入终态 `cancelled`：不再重试、不参与熔断计数、不阻塞同订阅后续任务；响应返回各类数量，重复撤销幂等，不存在的事件返回 `404`，撤销状态在 `GET /events/{id}` 中明确展示
 - **按订阅严格有序**：同一订阅的任务按 `task_id` 升序（即提交顺序）依次投递——前一条任务处于 `pending`/`in_progress` 时后续任务不会被认领，前一条 `delivered` 或 `failed` 后才放行下一条；不同订阅之间互不影响，仍可由多个工作器并行投递
@@ -60,6 +61,13 @@ curl -s -X POST http://localhost:8000/events \
 
 curl -s -X POST http://localhost:8000/events/evt-demo/cancel
 curl -s http://localhost:8000/events/evt-demo
+
+# 定时投递：60 秒后再投（Z = UTC；必须带时区且为未来时间）
+LATER=$(date -u -d '+60 seconds' +%Y-%m-%dT%H:%M:%SZ)
+curl -s -X POST http://localhost:8000/events \
+  -H 'Content-Type: application/json' \
+  -d "{\"event_id\": \"evt-later\", \"subscription_ids\": [\"$SID\"], \"payload\": {\"msg\": \"later\"}, \"deliver_at\": \"$LATER\"}"
+curl -s http://localhost:8000/events/evt-later   # status=pending，deliver_at 为计划时间
 ```
 
 ## API 使用示例
@@ -146,16 +154,49 @@ curl -s -X POST http://localhost:8000/events \
 {
   "event_id": "evt-001",
   "created": [
-    {"task_id": 1, "subscription_id": "44a79d7077ce", "status": "pending"},
-    {"task_id": 2, "subscription_id": "94d3c624dad2", "status": "pending"}
+    {"task_id": 1, "subscription_id": "44a79d7077ce", "status": "pending", "deliver_at": null},
+    {"task_id": 2, "subscription_id": "94d3c624dad2", "status": "pending", "deliver_at": null}
   ],
   "duplicates": []
 }
 ```
 
-- 重复提交相同 `event_id` + 订阅：返回 `200`，已存在的任务出现在 `duplicates` 中，不会重复投递
-- 相同 `event_id` 但 payload 不同：返回 `409 Conflict`
-- 包含不存在的订阅 ID：返回 `400`
+#### 定时投递（deliver_at）
+
+请求体可选 `deliver_at` 字段指定投递时间：
+
+```bash
+curl -s -X POST http://localhost:8000/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "event_id": "evt-scheduled",
+        "subscription_ids": ["44a79d7077ce"],
+        "payload": {"msg": "happy new year"},
+        "deliver_at": "2027-01-01T00:00:00Z"
+      }'
+```
+
+```json
+{
+  "event_id": "evt-scheduled",
+  "created": [
+    {"task_id": 1, "subscription_id": "44a79d7077ce", "status": "pending",
+     "deliver_at": "2027-01-01T00:00:00+00:00"}
+  ],
+  "duplicates": []
+}
+```
+
+行为约定：
+
+- **字段格式**：`deliver_at` 必须是**带显式时区**的未来 ISO-8601 时间——`Z` 结尾的 UTC 时间（`2027-01-01T00:00:00Z`）或带偏移量的时间（`2027-01-01T08:00:00+08:00`）均可；省略或显式传 `null` 表示立即投递。
+- **校验错误返回 `422`**：过去时间（含恰好等于当前时间）、无时区的朴素时间（`2027-01-01T00:00:00`）、只有日期（`2027-01-01`）、无法解析的字符串或非字符串类型，均返回 `422 Unprocessable Entity`，事件与任务均不会入库。
+- **到点前不认领**：计划时间以 epoch 秒持久化到任务并作为任务的首次到期时间；工作器的认领查询只选择到期任务，因此定时任务在 `deliver_at` 之前始终保持 `pending`，任何工作器（含服务重启后的工作器）都不会提前投递。调度不依赖进程内定时器，服务在到点前重启也不会提前或丢失投递，到点后按原计划执行。
+- **定时任务阻塞后续任务**：定时任务等待期间仍是 `pending`，按订阅严格有序规则会**阻塞同订阅的所有后续任务**——即使后续事件是立即投递（无 `deliver_at`）的，也要等这条定时任务到达终态（`delivered` / `failed` / `cancelled`）后才会被认领；不同订阅互不影响，仍并行投递。
+- **失败重试与撤销**：到点后的投递失败按普通退避规则重试（1s → 2s → 4s）；定时任务在到点前可以随事件被 `POST /events/{id}/cancel` 撤销（与普通 `pending` 任务一样），撤销后立即解除对后续任务的阻塞。
+- **暂停与熔断**：订阅暂停或熔断期间到点的定时任务继续等待，恢复/熔断放行后按原 `deliver_at`（已过则立即）与 `task_id` 顺序投递。
+- **幂等**：重复提交相同 `event_id` + 订阅返回 `200`，已存在的任务出现在 `duplicates` 中并保留其**首次提交时的计划时间**，重复请求中的 `deliver_at` 不会改写调度；相同 `event_id` 但 payload 不同返回 `409`；包含不存在的订阅 ID 返回 `400`。
+- **状态可见**：`POST /events` 的 `created` / `duplicates` 条目与 `GET /events/{id}` 的每个 target 都带 `deliver_at` 字段（ISO 时间，立即投递的任务为 `null`）。
 
 ### 4. 查询事件状态
 
@@ -175,6 +216,7 @@ curl -s http://localhost:8000/events/evt-001
       "status": "delivered",
       "attempts": 3,
       "max_attempts": 4,
+      "deliver_at": null,
       "next_attempt_at": null,
       "last_status_code": 200,
       "last_error": null,
@@ -189,8 +231,9 @@ curl -s http://localhost:8000/events/evt-001
 }
 ```
 
-`status` 取值：`pending`（等待执行）/ `in_progress`（投递中）/ `delivered`（成功）/ `failed`（最终失败）/ `cancelled`（随事件撤销，从未投递）。
-`next_attempt_at` 仅在 `pending` 时有值，即下次执行时间。
+`status` 取值：`pending`（等待执行，含定时未到点）/ `in_progress`（投递中）/ `delivered`（成功）/ `failed`（最终失败）/ `cancelled`（随事件撤销，从未投递）。
+`deliver_at` 是提交时请求的计划投递时间（ISO 时间）；立即投递的任务为 `null`，定时任务即使已投递/失败/撤销也保留该值。
+`next_attempt_at` 仅在 `pending` 时有值，即下次执行时间——定时任务在到点前它等于 `deliver_at`，失败退避期间为重试到期时间。
 
 事件是否被撤销过在顶层明确展示：`cancelled`（布尔，只要有一个任务为 `cancelled` 即为 `true`）与 `cancelled_at`（最近一次实际撤销动作的 ISO 时间，从未撤销为 `null`）；`counts` 给出该事件各状态任务数量（`pending` / `in_progress` / `delivered` / `failed` / `cancelled`），被撤销的任务还带有各自的 `cancelled_at`：
 
@@ -208,7 +251,7 @@ curl -s http://localhost:8000/events/evt-001
 }
 ```
 
-注意：若同一订阅存在更早的未完成任务，后续任务会因有序调度而保持 `pending`（被前序任务阻塞），状态查询会如实展示这些被阻塞的任务。
+注意：若同一订阅存在更早的未完成任务，后续任务会因有序调度而保持 `pending`（被前序任务阻塞），状态查询会如实展示这些被阻塞的任务。定时投递（`deliver_at`）是最常见的阻塞来源：一条尚未到点的定时任务会阻塞同订阅的全部后续任务（包括立即投递的任务）。
 
 ### 5. 撤销事件投递（POST /events/{id}/cancel）
 
@@ -326,7 +369,7 @@ curl -s http://localhost:8000/subscriptions/44a79d7077ce
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `POST` | `/ingest` | HMAC 保护的入站事件接口（时间窗 + 签名 + ID 幂等） |
-| `POST` | `/events` | 内部提交事件（event_id + payload，无需签名） |
+| `POST` | `/events` | 内部提交事件（event_id + payload，无需签名；可选 `deliver_at` 定时投递） |
 | `GET` | `/events/{id}` | 查询事件投递状态（含 `cancelled` / `cancelled_at` / 各状态 `counts`） |
 | `POST` | `/events/{id}/cancel` | 撤销事件未认领的投递任务（原子、幂等，不存在返回 404） |
 | `GET` | `/subscriptions` | 列出全部订阅（含 `paused` / `paused_at` 与熔断器 `state` / `consecutive_failures` / `next_probe_at`） |
@@ -341,7 +384,7 @@ curl -s http://localhost:8000/subscriptions/44a79d7077ce
 
 同一 `subscription_id` 下的投递任务按 `tasks.id` 升序（即任务创建顺序）逐条投递，语义如下：
 
-- 较早任务处于 `pending`（含退避等待重试中）或 `in_progress`（投递中）时，同订阅的后续任务**不会被任何工作器认领**；
+- 较早任务处于 `pending`（含退避等待重试中、以及定时任务等待 `deliver_at` 到点）或 `in_progress`（投递中）时，同订阅的后续任务**不会被任何工作器认领**；定时任务因此会阻塞其后的立即投递任务；
 - 较早任务到达终态——`delivered`（成功）、`failed`（重试耗尽后最终失败）或 `cancelled`（随事件撤销）——才放行同订阅的下一条任务；
 - 不同订阅之间没有顺序约束，`WORKER_COUNT` 个工作器可并行投递不同订阅的任务；
 - 约束在认领时基于 SQLite 中的持久化状态判定，因此失败重试、服务重启（含崩溃恢复）后依然有效；
@@ -387,6 +430,7 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 - **密钥轮换**：`subscriptions` 表新增 `previous_secret` 与 `previous_secret_expires_at` 两列（老库由启动迁移自动 `ALTER TABLE` 补齐），二者始终同时设置或同时清空。轮换在连接锁保护的单次提交中原子完成——当前密钥降级为 previous 并写入绝对失效时间，`secret` 列更新为新密钥；`grace_seconds=0` 时直接清空 previous 列。工作器每次认领任务时随连接读出当前密钥状态，构造请求头时按发送时刻判定宽限期是否结束，因此重试、重启后均按当时状态签名；宽限期未结束的再次轮换在判定阶段即被拒绝（409），不产生任何写操作。查询接口只读取失效时间戳推导 `rotating` 标志，密钥明文从不离开持久层进入响应或日志。
 - **投递熔断器**：`subscriptions` 表新增 `breaker_state`、`breaker_consecutive_failures`、`breaker_next_probe_at`、`breaker_probe_task_id` 四列（老库由启动迁移自动补齐，存量订阅初始为 `closed`/0）。任务终态（`delivered`/`failed`）与熔断器记账在 `finish_attempt` 的同一个 SQLite 事务中提交：最终失败使连续失败数加一，达到 `BREAKER_FAILURE_THRESHOLD` 即原子切为 `open` 并写入 `next_probe_at = 失败时刻 + BREAKER_COOLDOWN_SECONDS`；任意成功投递清零计数。认领查询按熔断状态过滤——`open` 且冷却未到的订阅不可认领；冷却到期后首个认领把订阅原子翻为 `half_open` 并把该任务（按订阅有序约束保证即最早待投递任务）登记为唯一探针，`half_open` 期间认领查询只允许探针任务本身通过，故多工作器并发下探针唯一；探针成功则关闭并清零，最终失败则重新 `open` 并以该失败时刻刷新冷却。全部状态持久化，重启（含崩溃恢复）后冷却计时与探针唯一性继续生效。
 - **崩溃恢复**：启动时将残留的 `in_progress` 任务重置为 `pending` 并立即到期；`pending` 任务按原 `next_attempt_at` 继续调度。崩溃恢复把未完成任务重新视为“尚未认领”，因此若其事件在恢复后被撤销，这些任务会随撤销终止；未撤销则照常重新投递。
+- **定时投递**：`POST /events` 的可选 `deliver_at` 在 Pydantic 模型层校验——必须是可解析的 ISO-8601 字符串、带显式时区偏移（拒绝无时区的朴素时间与纯日期）、且严格晚于当前时刻，任何不满足均返回 `422` 且不写库；通过后转换为 UTC epoch 秒。`tasks` 表新增 `deliver_at REAL` 列保存该计划时间（立即投递为 `NULL`），并在建任务时用它初始化 `next_attempt_at`，因此“到点前不认领”无需任何进程内定时器，完全由认领查询既有的 `next_attempt_at <= now` 条件保证，服务重启、崩溃恢复后同样成立。等待中的定时任务状态仍是 `pending`，认领查询既有的按订阅有序 `NOT EXISTS` 条件使其自动阻塞同订阅后续所有任务（包括立即到期的任务），直到定时任务本身进入终态；不同订阅照常并行投递。定时任务到点后的投递、失败退避、撤销、暂停恢复、熔断探针等路径与普通任务完全复用，无需特判。老库迁移：经 `cancelled` 表重建升级的最老库在重建时直接带上 `deliver_at` 列；已有 `cancelled_at` 但缺少该列的较新库通过 `ALTER TABLE tasks ADD COLUMN deliver_at REAL` 补齐，存量任务取值 `NULL`（即立即投递语义）。
 - **事件级撤销**：`tasks.status` 增加终态 `cancelled` 并新增 `cancelled_at` 列（新建库直接具备；老库启动迁移时按 SQLite 官方表重建流程——`foreign_keys=OFF`、单个显式事务内建新表、拷贝数据、DROP、RENAME、重建 `tasks` 上的两个索引——自动升级，既有任务数据原样保留）。`POST /events/{id}/cancel` 调用的 `cancel_event` 在连接锁保护的单个事务中执行：事件不存在直接返回 `None`（API 返回 `404`）；否则一条 `UPDATE ... WHERE event_id=? AND status='pending'` 原子地只撤销尚未认领的任务（写入 `cancelled_at`、清空 `next_attempt_at`/`claimed_by`），`in_progress` 与已结束任务不在 WHERE 命中范围内、结果不变；随后按状态 `GROUP BY` 计数返回。由于认领查询只选 `pending` 且有序约束只盯 `pending`/`in_progress`，撤销行既不会被重试、也不会阻塞同订阅后续任务；撤销从不经过 `finish_attempt`，故完全不触碰熔断器记账。唯一需要修复的边角是 half-open 探针在两次尝试之间回到 `pending` 时被撤销：同一事务内把该订阅熔断器从 `half_open` 转回 `open`、探针立即到期并清空探针归属，使下一个待投递任务成为替代探针，避免订阅永久卡在 half-open。重复撤销时 UPDATE 命中 0 行，响应 `cancelled=0` 且计数稳定，天然幂等；撤销与工作器认领共用同一把连接锁，并发下每个任务只可能“被认领（投递并记账）”或“被撤销”，不会重复领取也不会状态错乱。
 - **退避策略**：第 n 次失败后延迟 `2^(n-1)` 秒（1、2、4），第 4 次失败后任务终止，结果为 `failed`。
 - **成功判定**：仅 HTTP 2xx 视为成功；其余状态码、连接错误、超时均触发重试。

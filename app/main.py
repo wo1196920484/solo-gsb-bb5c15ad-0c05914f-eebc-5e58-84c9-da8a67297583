@@ -194,10 +194,26 @@ def submit_event(body: EventCreate, response: Response) -> dict:
     elif existing != payload:
         raise HTTPException(409, f"event {body.event_id!r} already exists with a different payload")
 
+    # Optional scheduled delivery. Stored as epoch seconds and seeded into
+    # each task's next_attempt_at, so workers simply cannot claim the tasks
+    # before this instant; None means the tasks are due right away.
+    deliver_at_ts = (
+        body.deliver_at.astimezone(timezone.utc).timestamp()
+        if body.deliver_at is not None
+        else None
+    )
+
     created, duplicates = [], []
     for sid in dict.fromkeys(body.subscription_ids):  # preserve order, drop repeats
-        task, was_created = db.create_task(body.event_id, sid, config.MAX_ATTEMPTS)
-        ref = {"task_id": task["id"], "subscription_id": sid, "status": task["status"]}
+        task, was_created = db.create_task(
+            body.event_id, sid, config.MAX_ATTEMPTS, deliver_at=deliver_at_ts
+        )
+        ref = {
+            "task_id": task["id"],
+            "subscription_id": sid,
+            "status": task["status"],
+            "deliver_at": _iso(task["deliver_at"]),
+        }
         (created if was_created else duplicates).append(ref)
 
     response.status_code = 201 if created else 200
@@ -330,6 +346,7 @@ def get_event_status(event_id: str) -> dict:
                 "status": t["status"],
                 "attempts": t["attempts"],
                 "max_attempts": t["max_attempts"],
+                "deliver_at": _iso(t["deliver_at"]),
                 "next_attempt_at": _iso(t["next_attempt_at"]) if t["status"] == "pending" else None,
                 "last_status_code": t["last_status_code"],
                 "last_error": t["last_error"],

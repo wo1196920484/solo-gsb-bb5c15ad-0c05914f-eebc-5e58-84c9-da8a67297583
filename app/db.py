@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS tasks (
                        ('pending', 'in_progress', 'delivered', 'failed', 'cancelled')),
     attempts         INTEGER NOT NULL DEFAULT 0,
     max_attempts     INTEGER NOT NULL,
+    deliver_at       REAL,              -- requested scheduled time (epoch seconds); NULL = immediate
     next_attempt_at  REAL,              -- epoch seconds; NULL once finished
     claimed_by       TEXT,
     last_status_code INTEGER,
@@ -160,6 +161,7 @@ class Database:
                                             'failed', 'cancelled')),
                         attempts         INTEGER NOT NULL DEFAULT 0,
                         max_attempts     INTEGER NOT NULL,
+                        deliver_at       REAL,
                         next_attempt_at  REAL,
                         claimed_by       TEXT,
                         last_status_code INTEGER,
@@ -176,10 +178,10 @@ class Database:
                     """
                     INSERT INTO tasks_new
                         (id, event_id, subscription_id, status, attempts, max_attempts,
-                         next_attempt_at, claimed_by, last_status_code, last_error,
+                         deliver_at, next_attempt_at, claimed_by, last_status_code, last_error,
                          result, created_at, updated_at, cancelled_at)
                     SELECT id, event_id, subscription_id, status, attempts, max_attempts,
-                           next_attempt_at, claimed_by, last_status_code, last_error,
+                           NULL, next_attempt_at, claimed_by, last_status_code, last_error,
                            result, created_at, updated_at, NULL
                     FROM tasks
                     """
@@ -200,6 +202,15 @@ class Database:
                 # Re-enable foreign keys while outside the transaction; the
                 # constructor's ON setting is what every new connection gets.
                 self._conn.execute("PRAGMA foreign_keys=ON")
+            # The rebuild above already has the column; refresh the set so
+            # the ALTER below is skipped for this database.
+            task_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
+
+        if "deliver_at" not in task_cols:
+            # A database created by a version that already had 'cancelled'
+            # but predates scheduled delivery: just add the column. Existing
+            # rows get NULL, i.e. their tasks were immediate submissions.
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN deliver_at REAL")
 
     def close(self) -> None:
         with self._lock:
@@ -352,19 +363,32 @@ class Database:
             )
             self._conn.commit()
 
-    def create_task(self, event_id: str, subscription_id: str, max_attempts: int) -> tuple[dict, bool]:
+    def create_task(
+        self,
+        event_id: str,
+        subscription_id: str,
+        max_attempts: int,
+        deliver_at: float | None = None,
+    ) -> tuple[dict, bool]:
         """Insert a task unless one already exists for (event_id, subscription_id).
+
+        deliver_at is the requested scheduled delivery time (epoch seconds);
+        None means the task is due immediately. It also seeds
+        next_attempt_at, so the worker claim query does not pick the task up
+        before the scheduled time. Scheduling on an already-existing
+        (duplicate) task is never changed.
 
         Returns (task_row, created) so callers can report duplicates.
         """
         now = time.time()
+        due = deliver_at if deliver_at is not None else now
         with self._lock:
             cur = self._conn.execute(
                 """INSERT OR IGNORE INTO tasks
                        (event_id, subscription_id, status, attempts, max_attempts,
-                        next_attempt_at, created_at, updated_at)
-                   VALUES (?, ?, 'pending', 0, ?, ?, ?, ?)""",
-                (event_id, subscription_id, max_attempts, now, now, now),
+                        deliver_at, next_attempt_at, created_at, updated_at)
+                   VALUES (?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                (event_id, subscription_id, max_attempts, deliver_at, due, now, now),
             )
             created = cur.rowcount > 0
             row = self._conn.execute(
@@ -442,7 +466,14 @@ class Database:
                     "SELECT id, status FROM tasks WHERE event_id = ? AND subscription_id = ?",
                     (webhook_id, sid),
                 ).fetchone()
-                ref = {"task_id": task["id"], "subscription_id": sid, "status": task["status"]}
+                ref = {
+                    "task_id": task["id"],
+                    "subscription_id": sid,
+                    "status": task["status"],
+                    # POST /ingest never schedules; the explicit key keeps
+                    # the stored receipt current with the TaskRef schema.
+                    "deliver_at": None,
+                }
                 (created if cur.rowcount > 0 else duplicates).append(ref)
 
             receipt = {"event_id": webhook_id, "created": created, "duplicates": duplicates}
@@ -468,6 +499,15 @@ class Database:
         concurrent workers, and restarts. Different subscriptions are
         independent and still claimed in parallel; a blocked task simply
         stays 'pending' and remains visible as such in status queries.
+
+        Scheduled delivery: a task submitted with deliver_at in the future
+        is stored with next_attempt_at seeded to that instant, so the
+        t.next_attempt_at <= ? predicate makes every worker skip it until
+        its time comes (no in-memory timers, so the guarantee survives
+        restarts). Because it stays 'pending' while waiting, the ordering
+        rule above also makes it block every later task of the same
+        subscription -- including immediately-due ones -- until the
+        scheduled task itself has been delivered, failed, or cancelled.
 
         Event-cancelled tasks ('cancelled') are terminal and never selected:
         they neither retry nor count towards a subscription's breaker, and

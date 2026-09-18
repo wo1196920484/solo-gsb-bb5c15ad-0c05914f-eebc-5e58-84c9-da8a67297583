@@ -1,6 +1,7 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -47,6 +48,35 @@ class EventCreate(BaseModel):
     event_id: str = Field(min_length=1, max_length=128)
     subscription_ids: list[str] = Field(min_length=1, max_length=100)
     payload: dict[str, Any]
+    # Optional scheduled delivery time. When omitted the event's tasks are
+    # due immediately; when set it must be an explicit, timezone-aware
+    # ISO-8601 timestamp in the future (a 'Z' suffix is accepted).
+    deliver_at: datetime | None = Field(default=None)
+
+    @field_validator("deliver_at", mode="before")
+    @classmethod
+    def _validate_deliver_at(cls, v: Any) -> datetime | None:
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            dt = v
+        elif isinstance(v, str):
+            text = v.strip()
+            try:
+                # fromisoformat accepts 'Z' on Python 3.11+.
+                dt = datetime.fromisoformat(text)
+            except ValueError:
+                raise ValueError("deliver_at must be an ISO-8601 timestamp")
+        else:
+            raise ValueError("deliver_at must be an ISO-8601 timestamp string")
+        # An ISO-8601 date without a time (e.g. "2026-09-20") parses to a
+        # naive midnight datetime; without an explicit timezone/offset the
+        # instant is ambiguous, so it is rejected.
+        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+            raise ValueError("deliver_at must include an explicit timezone, e.g. +00:00 or 'Z'")
+        if dt <= datetime.now(timezone.utc):
+            raise ValueError("deliver_at must be a time in the future")
+        return dt
 
 
 class IngestEvent(BaseModel):
@@ -65,6 +95,10 @@ class TaskRef(BaseModel):
     task_id: int
     subscription_id: str
     status: str
+    # Scheduled delivery time (ISO time); null = immediate. Has a default so
+    # receipts persisted by older versions (which lack the field) still
+    # validate when an idempotent replay returns the stored receipt.
+    deliver_at: str | None = None
 
 
 class EventAccepted(BaseModel):
@@ -89,6 +123,7 @@ class TaskStatus(BaseModel):
     status: str  # 'pending' | 'in_progress' | 'delivered' | 'failed' | 'cancelled'
     attempts: int
     max_attempts: int
+    deliver_at: str | None  # scheduled delivery time requested at submit (null = immediate)
     next_attempt_at: str | None
     last_status_code: int | None
     last_error: str | None
