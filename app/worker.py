@@ -24,6 +24,15 @@ once too many consecutive tasks have failed permanently: while 'open' no
 task of that subscription is claimed; after the cooldown the earliest
 pending task is claimed as the single half-open probe, closing the
 breaker on success or re-opening it (with a fresh cooldown) on failure.
+
+Scheduled events (POST /events with deliver_at) persist their earliest
+delivery time in tasks.deliver_at and seed next_attempt_at with it, so a
+scheduled task is simply not due until that instant. It is nevertheless
+a pending predecessor and blocks every later task of the same
+subscription per the ordering rule below: a later immediate event waits
+behind an earlier scheduled one. Once delivery time is reached and a
+first attempt has run, failures use the normal backoff schedule; the
+original deliver_at remains visible in GET /events/{id}.
 """
 from __future__ import annotations
 

@@ -1,6 +1,8 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
+import time
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -47,6 +49,24 @@ class EventCreate(BaseModel):
     event_id: str = Field(min_length=1, max_length=128)
     subscription_ids: list[str] = Field(min_length=1, max_length=100)
     payload: dict[str, Any]
+    # Optional earliest delivery time. Defaults to None = immediate. Must be
+    # an ISO-8601 string carrying an explicit timezone offset (naive values
+    # are rejected so the instant is unambiguous) and must lie in the future.
+    deliver_at: datetime | None = Field(default=None)
+
+    @field_validator("deliver_at")
+    @classmethod
+    def deliver_at_must_be_aware_and_future(cls, v: datetime | None) -> datetime | None:
+        if v is None:
+            return None
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError(
+                "deliver_at must include an explicit timezone offset, "
+                "e.g. '2030-01-01T09:00:00Z' or '2030-01-01T10:00:00+01:00'"
+            )
+        if v.timestamp() <= time.time():
+            raise ValueError("deliver_at must be a time in the future")
+        return v
 
 
 class IngestEvent(BaseModel):
@@ -90,6 +110,7 @@ class TaskStatus(BaseModel):
     attempts: int
     max_attempts: int
     next_attempt_at: str | None
+    deliver_at: str | None  # requested earliest delivery (ISO); null when submitted for immediate delivery
     last_status_code: int | None
     last_error: str | None
     result: str | None

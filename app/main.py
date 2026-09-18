@@ -195,8 +195,11 @@ def submit_event(body: EventCreate, response: Response) -> dict:
         raise HTTPException(409, f"event {body.event_id!r} already exists with a different payload")
 
     created, duplicates = [], []
+    # Epoch-seconds instant of the requested earliest delivery, or None for
+    # immediate. The validator already guaranteed a timezone-aware future time.
+    deliver_at = body.deliver_at.timestamp() if body.deliver_at is not None else None
     for sid in dict.fromkeys(body.subscription_ids):  # preserve order, drop repeats
-        task, was_created = db.create_task(body.event_id, sid, config.MAX_ATTEMPTS)
+        task, was_created = db.create_task(body.event_id, sid, config.MAX_ATTEMPTS, deliver_at)
         ref = {"task_id": task["id"], "subscription_id": sid, "status": task["status"]}
         (created if was_created else duplicates).append(ref)
 
@@ -331,6 +334,7 @@ def get_event_status(event_id: str) -> dict:
                 "attempts": t["attempts"],
                 "max_attempts": t["max_attempts"],
                 "next_attempt_at": _iso(t["next_attempt_at"]) if t["status"] == "pending" else None,
+                "deliver_at": _iso(t.get("deliver_at")),
                 "last_status_code": t["last_status_code"],
                 "last_error": t["last_error"],
                 "result": t["result"],

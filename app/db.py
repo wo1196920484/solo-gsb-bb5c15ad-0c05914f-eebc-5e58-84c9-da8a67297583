@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempts         INTEGER NOT NULL DEFAULT 0,
     max_attempts     INTEGER NOT NULL,
     next_attempt_at  REAL,              -- epoch seconds; NULL once finished
+    deliver_at       REAL,              -- requested earliest delivery (epoch seconds);
+                                        -- NULL when the event was submitted for immediate delivery
     claimed_by       TEXT,
     last_status_code INTEGER,
     last_error       TEXT,
@@ -161,6 +163,7 @@ class Database:
                         attempts         INTEGER NOT NULL DEFAULT 0,
                         max_attempts     INTEGER NOT NULL,
                         next_attempt_at  REAL,
+                        deliver_at       REAL,
                         claimed_by       TEXT,
                         last_status_code INTEGER,
                         last_error       TEXT,
@@ -176,12 +179,14 @@ class Database:
                     """
                     INSERT INTO tasks_new
                         (id, event_id, subscription_id, status, attempts, max_attempts,
-                         next_attempt_at, claimed_by, last_status_code, last_error,
+                         next_attempt_at, deliver_at, claimed_by, last_status_code, last_error,
                          result, created_at, updated_at, cancelled_at)
-                    SELECT id, event_id, subscription_id, status, attempts, max_attempts,
-                           next_attempt_at, claimed_by, last_status_code, last_error,
-                           result, created_at, updated_at, NULL
-                    FROM tasks
+                    SELECT t.id, t.event_id, t.subscription_id, t.status, t.attempts, t.max_attempts,
+                           t.next_attempt_at,
+                           CAST(NULL AS REAL),
+                           t.claimed_by, t.last_status_code, t.last_error,
+                           t.result, t.created_at, t.updated_at, NULL
+                    FROM tasks t
                     """
                 )
                 self._conn.execute("DROP TABLE tasks")
@@ -200,6 +205,15 @@ class Database:
                 # Re-enable foreign keys while outside the transaction; the
                 # constructor's ON setting is what every new connection gets.
                 self._conn.execute("PRAGMA foreign_keys=ON")
+
+        # Scheduled delivery: a tasks table created before this feature
+        # exists but already carrying cancelled_at was left untouched by the
+        # rebuild above, so add the column here. It defaults to NULL, i.e.
+        # every pre-existing task behaves as submitted for immediate
+        # delivery (its current next_attempt_at is unchanged).
+        task_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
+        if "deliver_at" not in task_cols:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN deliver_at REAL")
 
     def close(self) -> None:
         with self._lock:
@@ -352,19 +366,34 @@ class Database:
             )
             self._conn.commit()
 
-    def create_task(self, event_id: str, subscription_id: str, max_attempts: int) -> tuple[dict, bool]:
+    def create_task(
+        self,
+        event_id: str,
+        subscription_id: str,
+        max_attempts: int,
+        deliver_at: float | None = None,
+    ) -> tuple[dict, bool]:
         """Insert a task unless one already exists for (event_id, subscription_id).
+
+        deliver_at is the requested earliest delivery time (epoch seconds);
+        None means immediate. For a scheduled task it is persisted as
+        deliver_at and seeds next_attempt_at, so no worker claims it before
+        that instant -- it is only made earlier by failure-retry backoff
+        once the first delivery has actually been attempted. It also blocks
+        later tasks of the same subscription via the ordinary task_id
+        ordering rule: the later tasks stay unclaimed while this one waits.
 
         Returns (task_row, created) so callers can report duplicates.
         """
         now = time.time()
+        due = deliver_at if deliver_at is not None else now
         with self._lock:
             cur = self._conn.execute(
                 """INSERT OR IGNORE INTO tasks
                        (event_id, subscription_id, status, attempts, max_attempts,
-                        next_attempt_at, created_at, updated_at)
-                   VALUES (?, ?, 'pending', 0, ?, ?, ?, ?)""",
-                (event_id, subscription_id, max_attempts, now, now, now),
+                        next_attempt_at, deliver_at, created_at, updated_at)
+                   VALUES (?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                (event_id, subscription_id, max_attempts, due, deliver_at, now, now),
             )
             created = cur.rowcount > 0
             row = self._conn.execute(
@@ -479,6 +508,14 @@ class Database:
         become claimable again, in the same order, once resumed. Tasks
         already 'in_progress' when the pause lands are unaffected and
         run to completion.
+
+        Scheduled tasks (deliver_at in the future) are not due yet:
+        next_attempt_at seeds from deliver_at, so the t.next_attempt_at <= ?
+        predicate keeps them unclaimed until the requested time, after
+        which ordinary retry backoff applies. Such a waiting task is
+        still a pending/in_progress predecessor, so it blocks every
+        later task of the same subscription even though nothing is being
+        delivered yet.
 
         Circuit breaker: tasks of a subscription whose breaker is 'open'
         are not claimed until the cooldown expires (breaker_next_probe_at
